@@ -1,0 +1,86 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# default box when no VAGRANT_BOX / VAGRANT_BOX_URL environment is set
+BOX_NAME = "quantal"
+BOX_URL  = "http://cloud-images.ubuntu.com/vagrant/quantal/current/quantal-server-cloudimg-amd64-vagrant-disk1.box"
+
+CHEF_CLIENT_INSTALL = <<-EOF
+#!/bin/sh
+test -d /opt/chef || {
+  echo "Installing chef-client via omnibus"
+  curl -L -s https://www.opscode.com/chef/install.sh | bash
+}
+EOF
+
+CHEF_SERVER_INSTALL = <<-EOF
+#!/bin/sh
+test -d /opt/chef-server || {
+  echo "Installing chef-server via omnibus"
+  curl -L -s 'http://www.opscode.com/chef/download-server?p=ubuntu&pv=12.04&m=x86_64' > chef-server.dpkg
+  dpkg -i chef-server.dpkg
+  /opt/chef-server/bin/chef-server-ctl reconfigure >/dev/null
+}
+EOF
+
+CHEF_CREATE_WORKSTATION = <<-EOF
+#!/bin/sh
+[ -f "/vagrant/.chef/chef-validator.pem" ] && {
+  # compare chef-validator.pem file, don't continue when its already the same
+  server_md5=`md5sum /etc/chef-server/chef-validator.pem  | cut -f1 -d' '`
+  client_md5=`md5sum /vagrant/.chef/chef-validator.pem  | cut -f1 -d' '`
+  [ "$server_md5" = "$client_md5" ] && exit 0
+}
+echo "Creating workstation knife configuration"
+mkdir -p /vagrant/.chef
+cp /etc/chef-server/chef-validator.pem /vagrant/.chef/
+/opt/chef-server/bin/knife configure \
+    --initial --yes --verbose --repository /vagrant \
+    --server-url https://chefserver.vagrant.local \
+    --validation-client-name chef-validator --validation-key /etc/chef-server/chef-validator.pem \
+    --admin-client-name chef-webui --admin-client-key /etc/chef-server/chef-webui.pem \
+    --user "workstation" --key /vagrant/.chef/workstation.pem
+cat <<EOK > /vagrant/.chef/knife.rb
+cwd                     = File.dirname(__FILE__)
+log_level               :info   # valid values - :debug :info :warn :error :fatal
+log_location            STDOUT
+node_name               ENV.fetch('KNIFE_NODE_NAME', 'workstation')
+client_key              ENV.fetch('KNIFE_CLIENT_KEY', File.join(cwd,'workstation.pem'))
+chef_server_url         ENV.fetch('KNIFE_CHEF_SERVER_URL', 'https://chefserver.vagrant.local')
+validation_client_name  ENV.fetch('KNIFE_CHEF_VALIDATION_CLIENT_NAME', 'chef-validator')
+validation_key          ENV.fetch('KNIFE_CHEF_VALIDATION_KEY', File.join(cwd,'chef-validator.pem'))
+syntax_check_cache_path File.join(cwd,'syntax_check_cache')
+cookbook_path           File.join(cwd,'..','cookbooks')
+data_bag_path           File.join(cwd,'..','data_bags')
+role_path               File.join(cwd,'..','roles')
+EOK
+EOF
+
+Vagrant::Config.run do |config|
+  config.vm.box = ENV.fetch("VAGRANT_BOX", BOX_NAME)
+  config.vm.box_url = ENV.fetch("VAGRANT_BOX_URL", BOX_URL)
+
+  config.vm.define :chef_server do |v|
+    v.vm.customize ["modifyvm", :id, "--memory", 1024]
+    v.vm.network :hostonly, "192.168.33.10"
+    v.vm.host_name = "chefserver.vagrant.local"
+    v.vm.provision :shell, :inline => CHEF_CLIENT_INSTALL
+    v.vm.provision :shell, :inline => CHEF_SERVER_INSTALL
+    v.vm.provision :shell, :inline => CHEF_CREATE_WORKSTATION
+  end
+
+  config.vm.define :client do |v|
+    v.vm.network :hostonly, "192.168.33.20"
+    v.vm.host_name = "client.vagrant.local"
+    v.vm.provision :shell, :inline => CHEF_CLIENT_INSTALL
+    v.vm.provision :chef_client do |chef|
+      chef.chef_server_url = 'https://chefserver.vagrant.local'
+      chef.validation_key_path = ".chef/chef-validator.pem"
+      chef.validation_client_name = "chef-validator"
+      chef.run_list = [
+        # ... put something in here, or knife node edit client.vagrant.local
+      ]
+    end
+  end
+
+end
